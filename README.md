@@ -5,5 +5,9 @@
 ### 安装依赖
 ```bash
 pip install -r requirements.txt
+```
+
+### 运行
+```
 python live_day.py
 ```
