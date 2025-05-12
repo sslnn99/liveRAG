@@ -21,16 +21,18 @@ from utils import (
     
 )
 from tqdm import tqdm
-
-# 添加生成部分的代码
-# from langchain.chat_models import ChatOpenAI
+from collections import defaultdict
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage
 from sentence_transformers import CrossEncoder
 from concurrent.futures import ThreadPoolExecutor
+import json
+import pandas as pd
+from datetime import datetime
+
 
 # 初始化 Rerank 模型
-def get_reranker(model_name: str = "/data/sangshuailong/sigir_liveRAG/local_model/ms-marco-MiniLM-L-6-v2"):
+def get_reranker(model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
     return CrossEncoder(model_name)
 
 
@@ -61,10 +63,7 @@ def rewrite_query(query: str, generator) -> list:
                             Each query can contain different keywords, synonyms, grammatical changes, etc. Ensure that these variations increase search recall and cover more relevant content. Rewrite the user's original query into three items to make it more suitable for retrieval, and output the rewritten query in the form of a list."),
         HumanMessage(content=f"Original Query: {query}"),
     ]
-    # print("查询重写函数中的query和generator参数：", query)
     response = generator.invoke(messages)
-    # print("查询重写后的输出：\n", response.content)
-
     # 将多行字符串转换为列表
     try:
         # 按行分割
@@ -74,11 +73,11 @@ def rewrite_query(query: str, generator) -> list:
         # 去除每行的序号和多余空格
         rewritten_queries = [line.split(". ", 1)[1].strip() for line in lines if line.strip()]
         rewritten_queries = [query]+rewritten_queries
-        # print("重写后的查询:", rewritten_queries)
         return rewritten_queries
     except Exception as e:
         print(f"解析重写后的查询时出错: {e}")
         return []
+
 
 # 初始化生成模型
 def get_generator(api_key: str, base_url: str, model: str = "tiiuae/Falcon3-10B-Instruct"):
@@ -200,48 +199,6 @@ def rrf_fusion(rankings: list[list[dict]], k: int = 60) -> list[dict]:
     return sorted(all_docs.values(), key=lambda x: -doc_scores[x['doc_id']])
 
 
-
-def weighted_rrf_fusion(rankings: list[list[dict]], 
-                        weights: list[float], 
-                        k: int = 60) -> list[dict]:
-    """
-    加权RRF算法实现
-    :param rankings: 多个排序结果列表（顺序必须对应权重顺序）
-    :param weights: 各排序列表的权重（如[0.5, 0.3, 0.2]）
-    :param k: 平滑常数（建议60）
-    :return: 按加权RRF分数排序的文档列表
-    """
-    # 验证输入
-    if len(rankings) != len(weights):
-        raise ValueError("rankings和weights的长度必须相同")
-    if not all(0 <= w <= 1 for w in weights):
-        raise ValueError("权重必须在0到1之间")
-    
-    doc_scores = defaultdict(float)
-    
-    # 计算加权RRF分数（pinecone权重0.5，opensearch 0.3，hyde 0.2）
-    for ranking, weight in zip(rankings, weights):
-        for rank, doc in enumerate(ranking, 1):  # 排名从1开始
-            doc_scores[doc['doc_id']] += weight * (1 / (k + rank))
-    
-    # 合并文档元数据（保留所有字段）
-    all_docs = {}
-    for ranking in rankings:
-        for doc in ranking:
-            doc_id = doc['doc_id']
-            if doc_id not in all_docs:
-                all_docs[doc_id] = doc
-            else:
-                # 合并字段（以第一个出现的为准）
-                all_docs[doc_id].update({k: v for k, v in doc.items() 
-                                       if k not in all_docs[doc_id]})
-    
-    # 按加权RRF分数降序排序
-    return sorted(all_docs.values(), 
-                 key=lambda x: -doc_scores[x['doc_id']])
-
-
-
 def normalize_scores(docs, source):
     if not docs:
         return docs
@@ -291,7 +248,6 @@ def deduplicate_with_boost(os_docs, pc_docs, hyde_docs, boost_factor=0.1):
         unique_docs.append(best_doc)
     
     return sorted(unique_docs, key=lambda x: -x['boosted_score'])
-
 
 
 def get_final_prompt(query: str, context: str) -> str:
@@ -381,7 +337,7 @@ def hybrid_retrieve_with_hyde(
     boost_factor: float = 0.15  # 新增重复文档加分系数
 ) -> tuple:
     """
-    优化后的混合检索流程，修复bug并提升性能
+    优化后的混合检索流程
     """
     try:
         # 1. 并行执行查询重写和HYDE生成
@@ -451,14 +407,14 @@ def hybrid_retrieve_with_hyde(
             )[:top_k]
         else:
             final_docs = sorted(unique_docs, key=lambda x: -x['boosted_score'])[:top_k]
-        print("rrf完成=================")
-        # 5. 重排序（仅对top_k文档）
+
+        # 5. rerank
         if len(final_docs) > 0:
             reranker = get_reranker()
             final_docs = rerank_results(query, final_docs, reranker)
 
         # 6. 答案生成流程优化
-        context = "\n".join(doc['text'] for doc in final_docs[:3])  # 仅用前3个文档
+        context = "\n".join(doc['text'] for doc in final_docs)  # 仅用前3个文档
         compressed_context = context_compress(query, context, generator)
         final_prompt = get_final_prompt(query, compressed_context)
         answer = generate_answer(query, compressed_context, generator)
@@ -484,14 +440,8 @@ def hybrid_retrieve_with_hyde(
         return rewritten_queries, answer, final_docs, final_prompt
 
     except Exception as e:
-        logging.error(f"检索失败: {str(e)}", exc_info=True)
         return [], f"生成答案时出错: {str(e)}", [], []
-from collections import defaultdict
-import logging
-import json
-  
 
-import json
 
 def convert_to_jsonl_entry(index, query, answer, contexts, final_prompt):
     passages = []
@@ -520,32 +470,24 @@ def save_to_jsonl(data, output_file="output.jsonl"):
                 data["final_prompt"][i]
             )
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            # json.dump(data, file, ensure_ascii=False, indent=4)  # 写入时保留中文
+            
 
-
-import json
 def main_batch():
     data = {
         "question": [],
         "rewritten_query": [],
         "answer": [],
         "contexts": [],
-        "hyde_docs": [],  # 新增HYDE文档字段
-        "ground_truth": [],
         "final_prompt": []
     }
-
-    import pandas as pd
-    file_path = "/data/sangshuailong/sigir_liveRAG/LiveRAG_LCD_Session1_Question_file.jsonl"
+    file_path = "LiveRAG_LCD_Session1_Question_file.jsonl"
     # 读取 JSONL 文件
     df = pd.read_json(file_path, lines=True)
 
     # 提取 id 和 question 列
-    ids = df['id'].tolist()[100:200]
-    questions = df['question'].tolist()[100:200]
+    ids = df['id'].tolist()
+    questions = df['question'].tolist()
 
-    # 打印前 5 条
-    # print(df.head(5))
     for query,i in zip(questions, ids):
         query = query.strip()
         if not query:
@@ -569,22 +511,20 @@ def main_batch():
         data["rewritten_query"].append(rewritten_query)
         data["answer"].append(answer)
         data["contexts"].append(contexts)
-        # data["hyde_docs"].append(hyde_docs)  # 记录HYDE文档
         data["final_prompt"].append(final_prompt)
         
 
         print(f"Question(问题) {i}: {query}")
-        # print(f"HYDE Docs: {hyde_docs}")
         print(f"Answer: {answer}")
         print('=' * 50)
-        save_to_jsonl(data, output_file="/data/sangshuailong/sigir_liveRAG/DryTest/100-200.jsonl")
+        save_to_jsonl(data, output_file="answer.jsonl")
 
 
 if __name__ == "__main__":
     AI71_API_KEY = "ai71-api-e141e495-2f9f-4cd2-b100-1e28f0784928"
     AI71_BASE_URL = "https://api.ai71.ai/v1/"
     generator = get_generator(AI71_API_KEY, AI71_BASE_URL)
-    from datetime import datetime
+
 
     # 记录开始时间（带日期）
     start_time = datetime.now()
